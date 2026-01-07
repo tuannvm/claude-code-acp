@@ -31,6 +31,7 @@ import {
   WriteTextFileResponse,
 } from "@agentclientprotocol/sdk";
 import { SettingsManager } from "./settings.js";
+import { createNativeHistoryManager, NativeHistoryManager } from "./history-native.js";
 import {
   CanUseTool,
   McpServerConfig,
@@ -77,6 +78,14 @@ type Session = {
   cancelled: boolean;
   permissionMode: PermissionMode;
   settingsManager: SettingsManager;
+  // Track session metadata for native persistence
+  cwd: string;
+  sessionId: string;
+  gitBranch?: string;
+  parentUuid: string | null;
+  isSidechain: boolean;
+  version: string;
+  userType: "external" | "internal";
 };
 
 type BackgroundTerminal =
@@ -146,12 +155,15 @@ export class ClaudeAcpAgent implements Agent {
   backgroundTerminals: { [key: string]: BackgroundTerminal } = {};
   clientCapabilities?: ClientCapabilities;
   logger: Logger;
+  nativeHistoryManager: NativeHistoryManager;
 
   constructor(client: AgentSideConnection, logger?: Logger) {
     this.sessions = {};
     this.client = client;
     this.toolUseCache = {};
     this.logger = logger ?? console;
+    // Initialize native history manager (reads Claude Code's .jsonl files)
+    this.nativeHistoryManager = createNativeHistoryManager();
   }
 
   async initialize(request: InitializeRequest): Promise<InitializeResponse> {
@@ -258,7 +270,16 @@ export class ClaudeAcpAgent implements Agent {
 
     const { query, input } = this.sessions[params.sessionId];
 
-    input.push(promptToClaude(params));
+    const claudeMessage = promptToClaude(params);
+    input.push(claudeMessage);
+
+    // Write user prompt to native history for two-way sync
+    this.writeSessionEntry(
+      this.sessions[params.sessionId],
+      "user",
+      claudeMessage.message.content,
+    );
+
     while (true) {
       const { value: message, done } = await query.next();
       if (done || !message) {
@@ -377,6 +398,16 @@ export class ClaudeAcpAgent implements Agent {
             message.message.content[0].text.includes("Please run /login")
           ) {
             throw RequestError.authRequired();
+          }
+
+          // Write assistant message to native history for two-way sync
+          // We write the full message content, not the filtered version sent to client
+          if (message.type === "assistant") {
+            this.writeSessionEntry(
+              this.sessions[params.sessionId],
+              "assistant",
+              message.message.content,
+            );
           }
 
           const content =
@@ -590,6 +621,40 @@ export class ClaudeAcpAgent implements Agent {
     };
   }
 
+  /**
+   * Write a session entry to the native .jsonl file
+   * This enables ACP sessions to appear in Claude Code's native history
+   */
+  private writeSessionEntry(
+    session: Session,
+    type: "user" | "assistant" | "system",
+    content: any,
+  ): void {
+    try {
+      const entry = {
+        parentUuid: session.parentUuid,
+        isSidechain: session.isSidechain,
+        userType: session.userType,
+        cwd: session.cwd,
+        sessionId: session.sessionId,
+        version: session.version,
+        gitBranch: session.gitBranch,
+        agentId: undefined,
+        type,
+        message: {
+          role: type,
+          content,
+        },
+        uuid: randomUUID(),
+        timestamp: new Date().toISOString(),
+      };
+      this.nativeHistoryManager.writeSessionEntry(session.sessionId, entry);
+    } catch (error) {
+      // Don't fail the session if history writing fails
+      this.logger.error("[claude-code-acp] Failed to write session entry:", error);
+    }
+  }
+
   private async createSession(
     params: NewSessionRequest,
     creationOpts: { resume?: string; forkSession?: boolean } = {},
@@ -780,6 +845,14 @@ export class ClaudeAcpAgent implements Agent {
       cancelled: false,
       permissionMode,
       settingsManager,
+      // Track session metadata for native persistence
+      cwd: params.cwd,
+      sessionId: sessionId,
+      gitBranch: options.extraArgs?.['git-branch'] as string | undefined,
+      parentUuid: null,
+      isSidechain: !!creationOpts.forkSession,
+      version: packageJson.version,
+      userType: "external",
     };
 
     const availableCommands = await getAvailableSlashCommands(q);

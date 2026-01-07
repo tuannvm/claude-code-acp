@@ -636,6 +636,194 @@ In sessions with ${acpToolNames.killShell} always use it instead of KillShell.`,
     );
   }
 
+  // History management tools - read from Claude Code's native .jsonl files
+  server.registerTool(
+    "list_sessions",
+    {
+      title: "List Sessions",
+      description: `Lists all available conversation history sessions from Claude Code's native storage.
+
+This tool reads from Claude Code's native .jsonl session files, ensuring complete
+compatibility with the native Claude Code CLI. All sessions created in ACP clients
+or native Claude Code will appear here.
+
+Use this tool to:
+- View all previously saved conversations
+- Find session IDs to load specific conversation history
+- Check which sessions are available for resuming
+
+Returns a list of sessions with their IDs, working directories, timestamps, and message counts.`,
+      inputSchema: {
+        limit: z
+          .number()
+          .optional()
+          .default(50)
+          .describe("Maximum number of sessions to return (default 50)"),
+        cwd: z
+          .string()
+          .optional()
+          .describe("Optional filter to only show sessions from a specific directory"),
+      },
+      annotations: {
+        title: "List history sessions",
+        readOnlyHint: true,
+        destructiveHint: false,
+        openWorldHint: false,
+        idempotentHint: true,
+      },
+    },
+    async (input: { limit?: number; cwd?: string }) => {
+      try {
+        const sessions = agent.nativeHistoryManager.listSessions({
+          limit: input.limit ?? 50,
+          cwd: input.cwd,
+        });
+
+        const stats = agent.nativeHistoryManager.getStats();
+
+        let output = `## Claude Code History Sessions\n\n`;
+        output += `Total sessions: ${stats.totalSessions}\n`;
+        output += `Total messages: ${stats.totalMessages}\n`;
+        output += `History size: ${(stats.totalSize / 1024).toFixed(2)} KB\n\n`;
+
+        if (sessions.length === 0) {
+          output += `No sessions found. History will be saved as you have conversations in Claude Code.\n`;
+        } else {
+          output += `### Recent Sessions\n\n`;
+          for (const session of sessions) {
+            const createdDate = new Date(session.createdAt).toLocaleString();
+            const updatedDate = new Date(session.updatedAt).toLocaleString();
+            output += `- **Session ID**: \`${session.sessionId}\`\n`;
+            output += `  - Working Directory: \`${session.cwd}\`\n`;
+            output += `  - Created: ${createdDate}\n`;
+            output += `  - Last Updated: ${updatedDate}\n`;
+            output += `  - Messages: ${session.messageCount}\n`;
+            if (session.lastMessage) {
+              output += `  - Last Message: ${session.lastMessage}\n`;
+            }
+            output += `\n`;
+          }
+        }
+
+        return {
+          content: [{ type: "text", text: output }],
+        };
+      } catch (error: any) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "Failed to list sessions: " + error.message,
+            },
+          ],
+        };
+      }
+    },
+  );
+
+  server.registerTool(
+    "load_session",
+    {
+      title: "Load Session",
+      description: `Loads the conversation history for a specific session from Claude Code's native storage.
+
+This tool reads from Claude Code's native .jsonl session files. The session ID can be
+found using the list_sessions tool.
+
+Note: To actually resume a session with full context, use the native Claude Code CLI
+with the session ID. This tool only displays the conversation history.
+
+Use this tool to:
+- View the full conversation history of a previous session
+- Review what was discussed in a specific session
+- Understand the context before resuming in native Claude Code`,
+      inputSchema: {
+        session_id: z.string().describe("The session ID to load history for"),
+      },
+      annotations: {
+        title: "Load session history",
+        readOnlyHint: true,
+        destructiveHint: false,
+        openWorldHint: false,
+        idempotentHint: true,
+      },
+    },
+    async (input: { session_id: string }) => {
+      try {
+        const session = agent.nativeHistoryManager.getSession(input.session_id);
+        if (!session) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Session not found: ${input.session_id}`,
+              },
+            ],
+          };
+        }
+
+        let output = `## Session: ${session.sessionId}\n\n`;
+        output += `- Working Directory: \`${session.cwd}\`\n`;
+        output += `- Created: ${new Date(session.createdAt).toLocaleString()}\n`;
+        output += `- Last Updated: ${new Date(session.updatedAt).toLocaleString()}\n`;
+        output += `- Messages: ${session.messageCount}\n`;
+        if (session.gitBranch) {
+          output += `- Git Branch: ${session.gitBranch}\n`;
+        }
+        output += `\n`;
+
+        output += `### Conversation History\n\n`;
+
+        if (session.messages.length === 0) {
+          output += `No messages found in this session.\n`;
+        } else {
+          for (const msg of session.messages) {
+            const role = msg.type.charAt(0).toUpperCase() + msg.type.slice(1);
+            const timestamp = new Date(msg.timestamp).toLocaleString();
+            output += `#### [${timestamp}] ${role}\n\n`;
+
+            // Display message content
+            const content = msg.message.content;
+            if (typeof content === "string") {
+              output += `${content}\n\n`;
+            } else if (Array.isArray(content)) {
+              // Handle structured content (tool uses, etc)
+              for (const item of content) {
+                if (item.type === "text") {
+                  output += `${item.text}\n\n`;
+                } else if (item.type === "tool_use") {
+                  output += `**Tool Use**: \`${item.name}\`\n`;
+                  output += `\`\`\`json\n${JSON.stringify(item.input, null, 2)}\n\`\`\`\n\n`;
+                } else if (item.type === "thinking") {
+                  output += `*Thinking: ${item.thinking}*\n\n`;
+                }
+              }
+            }
+          }
+        }
+
+        output += `\n---\n\n`;
+        output += `**Note**: This is a read-only view of the conversation history. `;
+        output += `To resume this session with full context, use Claude Code's native CLI or `;
+        output += `use the ACP client's resume functionality with the session ID:\n\n`;
+        output += `\`\`\`\nSession ID: ${session.sessionId}\n\`\`\`\n`;
+
+        return {
+          content: [{ type: "text", text: output }],
+        };
+      } catch (error: any) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "Failed to load session: " + error.message,
+            },
+          ],
+        };
+      }
+    },
+  );
+
   return server;
 }
 
